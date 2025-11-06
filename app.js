@@ -145,7 +145,7 @@ async function loadPeople() {
         if (error) throw error;
 
         if (data && data.length > 0) {
-            allPeople = data.map(p => ({ name: p.name, score: p.score }));
+            allPeople = data.map(p => ({ id: p.id, name: p.name, score: p.score }));
         } else {
             // If no data, use initial data
             allPeople = initialData;
