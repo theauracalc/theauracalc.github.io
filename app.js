@@ -12,6 +12,7 @@ let sortOrder = 'asc'; // 'asc' or 'desc'
 let currentFilter = { letter: '', score: '', search: '' };
 let isAdmin = false;
 let editingPersonId = null;
+let isInitialized = false; // Prevent multiple initializations
 
 // Admin User ID - Get this from Supabase Auth after creating your admin account
 // Go to Supabase Dashboard → Authentication → Users → Copy your User ID
@@ -110,14 +111,22 @@ const initialData = [
 
 // Initialize
 async function init() {
-    // Check admin status from sessionStorage
-    checkAdminStatus();
+    // Prevent multiple initializations
+    if (isInitialized) {
+        console.warn('Already initialized, skipping...');
+        return;
+    }
+    isInitialized = true;
+    
+    // Check admin status from Supabase Auth
+    await checkAdminStatus();
     
     // Check if Supabase is configured
     if (SUPABASE_URL === 'YOUR_SUPABASE_URL' || SUPABASE_ANON_KEY === 'YOUR_SUPABASE_ANON_KEY') {
         console.warn('Supabase not configured. Using local data. See SETUP.md for instructions.');
         allPeople = initialData;
         filterPeople();
+        setupEventListeners();
         return;
     }
 
@@ -160,6 +169,12 @@ async function loadPeople() {
 
 // Render people list
 function renderPeople() {
+    // Prevent rendering if element doesn't exist
+    if (!peopleList) {
+        console.error('People list element not found');
+        return;
+    }
+    
     if (filteredPeople.length === 0) {
         peopleList.innerHTML = '<div class="empty-state"><h3>No people found</h3><p>Try adjusting your filters</p></div>';
         return;
@@ -272,27 +287,32 @@ function toggleSort() {
 
 // Admin Functions
 async function checkAdminStatus() {
-    // Check if user is authenticated with Supabase
-    const { data: { session } } = await supabase.auth.getSession();
-    
-    if (session) {
-        const userId = session.user?.id;
-        // Check if this is the admin user
-        if (ADMIN_USER_ID && userId === ADMIN_USER_ID) {
-            isAdmin = true;
-            sessionStorage.setItem('isAdmin', 'true');
-            updateAdminUI();
-        } else if (!ADMIN_USER_ID) {
-            // If ADMIN_USER_ID not set, allow any authenticated user (testing only)
-            isAdmin = true;
-            sessionStorage.setItem('isAdmin', 'true');
-            updateAdminUI();
+    try {
+        // Check if user is authenticated with Supabase
+        const { data: { session } } = await supabase.auth.getSession();
+        
+        if (session) {
+            const userId = session.user?.id;
+            // Check if this is the admin user
+            if (ADMIN_USER_ID && userId === ADMIN_USER_ID) {
+                isAdmin = true;
+                sessionStorage.setItem('isAdmin', 'true');
+                updateAdminUI();
+            } else if (!ADMIN_USER_ID) {
+                // If ADMIN_USER_ID not set, allow any authenticated user (testing only)
+                isAdmin = true;
+                sessionStorage.setItem('isAdmin', 'true');
+                updateAdminUI();
+            }
+        } else {
+            // No active session, clear admin status
+            isAdmin = false;
+            sessionStorage.removeItem('isAdmin');
+            sessionStorage.removeItem('adminSession');
         }
-    } else {
-        // No active session, clear admin status
+    } catch (error) {
+        console.error('Error checking admin status:', error);
         isAdmin = false;
-        sessionStorage.removeItem('isAdmin');
-        sessionStorage.removeItem('adminSession');
     }
 }
 
@@ -396,6 +416,12 @@ async function addPerson(name, score) {
 
         if (error) throw error;
 
+        // Clear filters to show all people after add
+        currentFilter = { letter: '', score: '', search: '' };
+        searchInput.value = '';
+        letterFilter.value = '';
+        scoreFilter.value = '';
+        
         await loadPeople();
         closeModal(editModal);
         personForm.reset();
@@ -419,6 +445,12 @@ async function updatePerson(id, name, score) {
 
         if (error) throw error;
 
+        // Clear filters to show all people after edit
+        currentFilter = { letter: '', score: '', search: '' };
+        searchInput.value = '';
+        letterFilter.value = '';
+        scoreFilter.value = '';
+        
         await loadPeople();
         closeModal(editModal);
         personForm.reset();
@@ -443,6 +475,12 @@ async function deletePerson(id) {
 
         if (error) throw error;
 
+        // Clear filters to show all people after delete
+        currentFilter = { letter: '', score: '', search: '' };
+        searchInput.value = '';
+        letterFilter.value = '';
+        scoreFilter.value = '';
+        
         await loadPeople();
     } catch (error) {
         console.error('Error deleting person:', error);
@@ -566,6 +604,11 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// Initialize on load
-init();
+// Initialize on load - only once
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+} else {
+    // DOM already loaded
+    init();
+}
 
