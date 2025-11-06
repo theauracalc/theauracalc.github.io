@@ -17,6 +17,16 @@
             <button id="adminBtn" class="admin-btn">🔐 Admin</button>
         </header>
 
+        <!-- Breaking News Ticker -->
+        <div class="news-ticker-container" id="newsTickerContainer">
+            <div class="news-ticker-label">🔴 BREAKING</div>
+            <div class="news-ticker-wrapper">
+                <div class="news-ticker" id="newsTicker">
+                    <div class="news-item">Loading news...</div>
+                </div>
+            </div>
+        </div>
+
         <!-- Instructions Section -->
         <div class="instructions-section">
             <p class="instructions-text">This isn't for fun. It's real.</p>
@@ -85,6 +95,7 @@
             </div>
             <div id="adminControls" class="admin-controls" style="display: none;">
                 <button id="addPersonBtn" class="add-btn">+ Add Person</button>
+                <button id="manageNewsBtn" class="add-btn">📰 Manage News</button>
             </div>
         </div>
 
@@ -156,6 +167,33 @@
                     <button type="button" class="cancel-btn" id="cancelEditBtn">Cancel</button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- News Management Modal -->
+    <div id="newsModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>Manage Breaking News</h2>
+            <div class="news-form-section">
+                <h3>Add News</h3>
+                <form id="newsForm">
+                    <div class="form-group">
+                        <label for="newsText">News Text:</label>
+                        <input type="text" id="newsText" placeholder="Enter breaking news..." required>
+                    </div>
+                    <div class="form-actions">
+                        <button type="submit" class="submit-btn">Add News</button>
+                    </div>
+                </form>
+            </div>
+            <div class="news-list-section">
+                <h3>Current News</h3>
+                <div id="newsList" class="news-list"></div>
+            </div>
+            <div class="form-actions">
+                <button type="button" class="cancel-btn" id="closeNewsModalBtn">Close</button>
+            </div>
         </div>
     </div>
 
