@@ -678,6 +678,13 @@ async function userSignup(email, password, confirmPassword) {
         return false;
     }
 
+    // Block reserved usernames (case-insensitive)
+    const reservedUsernames = ['admin', 'administrator', 'mod', 'moderator', 'system'];
+    if (reservedUsernames.includes(username.toLowerCase())) {
+        showUserAuthError('This username is reserved. Please choose another.');
+        return false;
+    }
+
     try {
         const { data, error } = await supabase.auth.signUp({
             email: email,
@@ -1550,15 +1557,29 @@ async function setUsername(username) {
         return false;
     }
 
-    try {
-        // Check if username already exists (for other users)
-        const { data: existing, error: checkError } = await supabase
-            .from('user_profiles')
-            .select('user_id')
-            .eq('username', username)
-            .single();
+    // Block reserved usernames (case-insensitive)
+    const reservedUsernames = ['admin', 'administrator', 'mod', 'moderator', 'system'];
+    if (reservedUsernames.includes(username.toLowerCase())) {
+        showUsernameError('This username is reserved. Please choose another.');
+        return false;
+    }
 
-        if (existing && existing.user_id !== currentUser.id) {
+    try {
+        // Check if username already exists (case-insensitive check for other users)
+        // Get all usernames and check case-insensitively
+        const { data: allProfiles, error: checkError } = await supabase
+            .from('user_profiles')
+            .select('user_id, username');
+
+        if (checkError) throw checkError;
+
+        // Check if username exists (case-insensitive) for other users
+        const usernameExists = allProfiles?.some(profile => 
+            profile.username.toLowerCase() === username.toLowerCase() && 
+            profile.user_id !== currentUser.id
+        );
+
+        if (usernameExists) {
             showUsernameError('Username is already taken. Please choose another.');
             return false;
         }
