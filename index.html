@@ -78,6 +78,29 @@
             </div>
         </div>
 
+        <!-- Live Chat Section -->
+        <div class="chat-section">
+            <div class="chat-header">
+                <h2 class="chat-title">💬 Live Chat</h2>
+                <p class="chat-subtitle">Verified users only • Resets every 4 hours</p>
+            </div>
+            <div class="chat-container">
+                <div class="chat-messages" id="chatMessages">
+                    <div class="loading">Loading chat...</div>
+                </div>
+                <div class="chat-input-container">
+                    <input 
+                        type="text" 
+                        id="chatInput" 
+                        class="chat-input" 
+                        placeholder="Type your message... (Login to chat)"
+                        disabled
+                    >
+                    <button id="chatSendBtn" class="chat-send-btn" disabled>Send</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Controls Section -->
         <div class="controls-section">
             <div class="search-filter-row">
@@ -177,6 +200,11 @@
                     <input type="email" id="signupEmail" required autocomplete="email">
                 </div>
                 <div class="form-group">
+                    <label for="signupUsername">Username:</label>
+                    <input type="text" id="signupUsername" required autocomplete="username" minlength="3" maxlength="20" pattern="[a-zA-Z0-9_]+" title="Username must be 3-20 characters, letters, numbers, and underscores only">
+                    <small style="color: var(--text-gray); font-size: 0.8rem;">3-20 characters, letters, numbers, and underscores only</small>
+                </div>
+                <div class="form-group">
                     <label for="signupPassword">Password:</label>
                     <input type="password" id="signupPassword" required autocomplete="new-password" minlength="6">
                 </div>
@@ -188,6 +216,27 @@
                 <div class="form-actions">
                     <button type="submit" class="submit-btn">Sign Up</button>
                     <button type="button" class="cancel-btn" id="cancelSignupBtn">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Username Setup Modal -->
+    <div id="usernameModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>Set Your Username</h2>
+            <p style="color: var(--text-gray); margin-bottom: 20px;">Choose a username to use in chat. You can change it later.</p>
+            <form id="usernameForm">
+                <div class="form-group">
+                    <label for="usernameInput">Username:</label>
+                    <input type="text" id="usernameInput" required autocomplete="username" minlength="3" maxlength="20" pattern="[a-zA-Z0-9_]+" title="Username must be 3-20 characters, letters, numbers, and underscores only">
+                    <small style="color: var(--text-gray); font-size: 0.8rem;">3-20 characters, letters, numbers, and underscores only</small>
+                </div>
+                <div id="usernameError" class="error-message" style="display: none;"></div>
+                <div class="form-actions">
+                    <button type="submit" class="submit-btn">Set Username</button>
+                    <button type="button" class="cancel-btn" id="cancelUsernameBtn">Cancel</button>
                 </div>
             </form>
         </div>
