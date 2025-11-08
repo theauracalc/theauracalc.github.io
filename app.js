@@ -14,6 +14,10 @@ let isAdmin = false;
 let editingPersonId = null;
 let isInitialized = false; // Prevent multiple initializations
 let allNews = []; // Breaking news items
+let currentUser = null; // Current authenticated user
+let userVotes = {}; // Map of person_id -> vote_type for current user
+let lastNewsCheck = null; // Track last news check for notifications
+let newsCheckInterval = null; // Interval for checking new news
 
 // Admin User ID - Get this from Supabase Auth after creating your admin account
 // Go to Supabase Dashboard → Authentication → Users → Copy your User ID
@@ -33,16 +37,22 @@ const totalCount = document.getElementById('totalCount');
 const avgScore = document.getElementById('avgScore');
 const highestScore = document.getElementById('highestScore');
 const adminBtn = document.getElementById('adminBtn');
+const userAuthBtn = document.getElementById('userAuthBtn');
 const adminControls = document.getElementById('adminControls');
 const loginModal = document.getElementById('loginModal');
+const userAuthModal = document.getElementById('userAuthModal');
 const editModal = document.getElementById('editModal');
 const newsModal = document.getElementById('newsModal');
 const loginForm = document.getElementById('loginForm');
+const userLoginForm = document.getElementById('userLoginForm');
+const userSignupForm = document.getElementById('userSignupForm');
 const personForm = document.getElementById('personForm');
 const newsForm = document.getElementById('newsForm');
 const newsTicker = document.getElementById('newsTicker');
 const newsList = document.getElementById('newsList');
 const newsTickerContainer = document.getElementById('newsTickerContainer');
+const featuredUsers = document.getElementById('featuredUsers');
+const trendingUsers = document.getElementById('trendingUsers');
 
 // Initial data (fallback if Supabase is not configured)
 const initialData = [
@@ -124,6 +134,9 @@ async function init() {
     }
     isInitialized = true;
     
+    // Check user authentication status
+    await checkUserAuth();
+    
     // Check admin status from Supabase Auth
     await checkAdminStatus();
     
@@ -139,6 +152,15 @@ async function init() {
     try {
         await loadPeople();
         await loadNews();
+        if (currentUser) {
+            await loadUserVotes();
+        }
+        
+        // Load trending users
+        await loadTrendingUsers();
+        
+        // Start news notifications
+        startNewsNotifications();
     } catch (error) {
         console.error('Error initializing:', error);
         // Fallback to local data
@@ -149,7 +171,7 @@ async function init() {
     setupEventListeners();
 }
 
-// Load people from Supabase
+// Load people from Supabase and calculate scores from votes
 async function loadPeople() {
     try {
         const { data, error } = await supabase
@@ -161,16 +183,273 @@ async function loadPeople() {
         if (error) throw error;
 
         if (data && data.length > 0) {
-            allPeople = data.map(p => ({ id: p.id, name: p.name, score: p.score }));
+            // Calculate scores from votes
+            const peopleWithScores = await Promise.all(data.map(async (p) => {
+                const score = await calculateScoreFromVotes(p.id);
+                return { id: p.id, name: p.name, score: score };
+            }));
+            allPeople = peopleWithScores;
         } else {
             // If no data, use initial data
             allPeople = initialData;
         }
 
         filterPeople();
+        await loadFeaturedUsers(); // Load featured users after loading all people
     } catch (error) {
         console.error('Error loading people:', error);
         throw error;
+    }
+}
+
+// Calculate score from votes using a fair formula
+// Formula considers both approval ratio and total votes for fairness
+async function calculateScoreFromVotes(personId) {
+    try {
+        const { data: votes, error } = await supabase
+            .from('votes')
+            .select('vote_type')
+            .eq('person_id', personId);
+
+        if (error) throw error;
+
+        if (!votes || votes.length === 0) {
+            // If no votes, return 0 (scores are now calculated from votes)
+            return 0;
+        }
+
+        // Count upvotes and downvotes
+        let upvotes = 0;
+        let downvotes = 0;
+        votes.forEach(vote => {
+            if (vote.vote_type === 'up') {
+                upvotes += 1;
+            } else if (vote.vote_type === 'down') {
+                downvotes += 1;
+            }
+        });
+
+        const totalVotes = upvotes + downvotes;
+        
+        // Fair scoring formula that prevents extreme scores with few users:
+        // Combines approval ratio with vote count for balanced scoring
+        // Scores typically range from -150 to +150 with normal voting patterns
+        
+        const netVotes = upvotes - downvotes;
+        const approvalRatio = totalVotes > 0 ? upvotes / totalVotes : 0.5;
+        
+        // Confidence factor: logarithmic scaling based on total votes
+        // More votes = higher confidence, but caps to prevent extreme scores
+        // Formula: sqrt(totalVotes) / 2, capped at 2.0
+        // This means: 1 vote = 0.5, 4 votes = 1.0, 16 votes = 2.0 (max)
+        const confidenceFactor = Math.min(2.0, Math.sqrt(totalVotes) / 2);
+        
+        // Calculate score using approval ratio as a multiplier
+        // This rewards both having many positive votes AND high approval percentage
+        // Example: 10 up, 0 down = 10 * 1.0 * confidence = high score
+        // Example: 5 up, 5 down = 0 * 0.5 * confidence = 0 (neutral)
+        // Example: 8 up, 2 down = 6 * 0.8 * confidence = good score
+        
+        const baseScore = netVotes * approvalRatio;
+        
+        // Apply confidence and scale to reasonable range
+        // Multiplier of 8 keeps scores fair but meaningful
+        const score = Math.round(baseScore * confidenceFactor * 8);
+        
+        return score;
+    } catch (error) {
+        console.error('Error calculating score:', error);
+        return 0;
+    }
+}
+
+// Get upvote count for a person
+async function getUpvoteCount(personId) {
+    // If no personId (e.g., from initialData fallback), return 0
+    if (!personId) return 0;
+    
+    try {
+        const { data: votes, error } = await supabase
+            .from('votes')
+            .select('vote_type')
+            .eq('person_id', personId)
+            .eq('vote_type', 'up');
+
+        if (error) throw error;
+        return votes ? votes.length : 0;
+    } catch (error) {
+        console.error('Error getting upvote count:', error);
+        return 0;
+    }
+}
+
+// Get recent votes count for a person (last 24 hours)
+async function getRecentVotesCount(personId, hours = 24) {
+    if (!personId) return 0;
+    
+    try {
+        const hoursAgo = new Date();
+        hoursAgo.setHours(hoursAgo.getHours() - hours);
+        
+        const { data: votes, error } = await supabase
+            .from('votes')
+            .select('vote_type, created_at')
+            .eq('person_id', personId)
+            .gte('created_at', hoursAgo.toISOString());
+
+        if (error) throw error;
+        return votes ? votes.length : 0;
+    } catch (error) {
+        console.error('Error getting recent votes count:', error);
+        return 0;
+    }
+}
+
+// Load and render trending users (people with recent votes)
+async function loadTrendingUsers() {
+    if (!trendingUsers) return;
+
+    try {
+        // Filter out people without IDs
+        const peopleWithIds = allPeople.filter(p => p.id);
+        
+        if (peopleWithIds.length === 0) {
+            trendingUsers.innerHTML = '<div class="no-trending">No trending users yet. Start voting!</div>';
+            return;
+        }
+
+        // Get people with recent vote counts (last 24 hours)
+        const peopleWithRecentVotes = await Promise.all(
+            peopleWithIds.map(async (person) => {
+                const recentVotes = await getRecentVotesCount(person.id, 24);
+                return { ...person, recentVotes };
+            })
+        );
+
+        // Sort by recent votes (descending) and take top 5
+        const topTrending = peopleWithRecentVotes
+            .sort((a, b) => b.recentVotes - a.recentVotes)
+            .slice(0, 5)
+            .filter(p => p.recentVotes > 0); // Only show if they have recent votes
+
+        renderTrendingUsers(topTrending);
+    } catch (error) {
+        console.error('Error loading trending users:', error);
+        if (trendingUsers) {
+            trendingUsers.innerHTML = '<div class="no-trending">No trending users yet. Start voting!</div>';
+        }
+    }
+}
+
+// Render trending users
+function renderTrendingUsers(trending) {
+    if (!trendingUsers) return;
+
+    if (trending.length === 0) {
+        trendingUsers.innerHTML = '<div class="no-trending">No trending users yet. Start voting!</div>';
+        return;
+    }
+
+    trendingUsers.innerHTML = trending.map((person, index) => `
+        <div class="trending-user-card">
+            <div class="trending-rank">#${index + 1}</div>
+            <div class="trending-user-info">
+                <div class="trending-user-name">${escapeHtml(person.name)}</div>
+                <div class="trending-user-stats">
+                    <span class="trending-votes">${person.recentVotes} vote${person.recentVotes !== 1 ? 's' : ''} in last 24h</span>
+                    <span class="trending-score">Score: ${person.score > 0 ? '+' : ''}${person.score}</span>
+                </div>
+            </div>
+            <div class="trending-fire">🔥</div>
+        </div>
+    `).join('');
+}
+
+// Load and render featured users (top 3 by upvotes)
+async function loadFeaturedUsers() {
+    if (!featuredUsers) return;
+
+    try {
+        // Filter out people without IDs (from initialData fallback)
+        // Only process people that have IDs (from Supabase)
+        const peopleWithIds = allPeople.filter(p => p.id);
+        
+        if (peopleWithIds.length === 0) {
+            featuredUsers.innerHTML = '<div class="no-featured">No featured users yet. Start voting!</div>';
+            return;
+        }
+
+        // Get all people with their upvote counts
+        const peopleWithUpvotes = await Promise.all(
+            peopleWithIds.map(async (person) => {
+                const upvotes = await getUpvoteCount(person.id);
+                return { ...person, upvotes };
+            })
+        );
+
+        // Sort by upvotes (descending) and take top 3
+        const top3 = peopleWithUpvotes
+            .sort((a, b) => b.upvotes - a.upvotes)
+            .slice(0, 3)
+            .filter(p => p.upvotes > 0); // Only show if they have at least 1 upvote
+
+        renderFeaturedUsers(top3);
+    } catch (error) {
+        console.error('Error loading featured users:', error);
+        if (featuredUsers) {
+            featuredUsers.innerHTML = '<div class="no-featured">No featured users yet. Start voting!</div>';
+        }
+    }
+}
+
+// Render featured users
+function renderFeaturedUsers(top3) {
+    if (!featuredUsers) return;
+
+    if (top3.length === 0) {
+        featuredUsers.innerHTML = '<div class="no-featured">No featured users yet. Start voting!</div>';
+        return;
+    }
+
+    const medals = ['🥇', '🥈', '🥉'];
+    
+    featuredUsers.innerHTML = top3.map((person, index) => `
+        <div class="featured-user-card">
+            <div class="featured-medal">${medals[index]}</div>
+            <div class="featured-user-info">
+                <div class="featured-user-name">${escapeHtml(person.name)}</div>
+                <div class="featured-user-stats">
+                    <span class="featured-upvotes">${person.upvotes} upvote${person.upvotes !== 1 ? 's' : ''}</span>
+                    <span class="featured-score">Score: ${person.score > 0 ? '+' : ''}${person.score}</span>
+                </div>
+            </div>
+        </div>
+    `).join('');
+}
+
+// Load user's votes to show which people they've voted on
+async function loadUserVotes() {
+    if (!currentUser) return;
+
+    try {
+        const { data, error } = await supabase
+            .from('votes')
+            .select('person_id, vote_type')
+            .eq('user_id', currentUser.id);
+
+        if (error) throw error;
+
+        userVotes = {};
+        if (data) {
+            data.forEach(vote => {
+                userVotes[vote.person_id] = vote.vote_type;
+            });
+        }
+
+        // Re-render people to show vote status
+        renderPeople();
+    } catch (error) {
+        console.error('Error loading user votes:', error);
     }
 }
 
@@ -195,12 +474,35 @@ function renderPeople() {
             </div>
         ` : '';
         
+        // Vote buttons - only show if user is logged in
+        const userVote = userVotes[person.id];
+        const voteButtons = currentUser ? `
+            <div class="vote-buttons">
+                <button class="vote-btn vote-up ${userVote === 'up' ? 'active' : ''}" 
+                        onclick="voteOnPerson(${person.id}, 'up')" 
+                        title="${userVote === 'up' ? 'Click to undo upvote' : userVote === 'down' ? 'Click to change to upvote' : 'Vote up'}">
+                    ${userVote === 'up' ? '✓' : '↑'} Up
+                </button>
+                <button class="vote-btn vote-down ${userVote === 'down' ? 'active' : ''}" 
+                        onclick="voteOnPerson(${person.id}, 'down')" 
+                        title="${userVote === 'down' ? 'Click to undo downvote' : userVote === 'up' ? 'Click to change to downvote' : 'Vote down'}">
+                    ${userVote === 'down' ? '✓' : '↓'} Down
+                </button>
+            </div>
+        ` : `
+            <div class="vote-buttons">
+                <button class="vote-btn vote-up disabled" disabled title="Login to vote">↑ Up</button>
+                <button class="vote-btn vote-down disabled" disabled title="Login to vote">↓ Down</button>
+            </div>
+        `;
+        
         return `
-        <div class="person-card">
+        <div class="person-card" data-person-id="${person.id}">
             <div class="person-name">${escapeHtml(person.name)}</div>
             <div class="person-score ${getScoreClass(person.score)}">
                 ${person.score > 0 ? '+' : ''}${person.score}
             </div>
+            ${voteButtons}
             ${adminButtons}
         </div>
     `;
@@ -290,6 +592,306 @@ function toggleSort() {
     sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
     sortBtn.textContent = `Sort: ${sortOrder === 'asc' ? 'A-Z' : 'Z-A'}`;
     filterPeople();
+}
+
+// User Authentication Functions
+async function checkUserAuth() {
+    try {
+        const { data: { session } } = await supabase.auth.getSession();
+        
+        if (session && session.user) {
+            currentUser = session.user;
+            updateUserAuthUI();
+        } else {
+            currentUser = null;
+            userVotes = {};
+            updateUserAuthUI();
+        }
+    } catch (error) {
+        console.error('Error checking user auth:', error);
+        currentUser = null;
+    }
+}
+
+function updateUserAuthUI() {
+    if (userAuthBtn) {
+        if (currentUser) {
+            userAuthBtn.textContent = `👤 ${currentUser.email}`;
+            userAuthBtn.title = 'Click to logout';
+        } else {
+            userAuthBtn.textContent = '👤 Login';
+            userAuthBtn.title = 'Click to login or sign up';
+        }
+    }
+}
+
+async function userSignup(email, password, confirmPassword) {
+    if (password !== confirmPassword) {
+        showUserAuthError('Passwords do not match');
+        return false;
+    }
+
+    if (password.length < 6) {
+        showUserAuthError('Password must be at least 6 characters');
+        return false;
+    }
+
+    try {
+        const { data, error } = await supabase.auth.signUp({
+            email: email,
+            password: password
+        });
+
+        if (error) {
+            showUserAuthError(error.message);
+            return false;
+        }
+
+        if (data.user) {
+            currentUser = data.user;
+            updateUserAuthUI();
+            closeModal(userAuthModal);
+            userSignupForm.reset();
+            hideUserAuthError();
+            await loadUserVotes();
+            await loadPeople(); // Reload to show vote buttons
+            return true;
+        }
+    } catch (error) {
+        console.error('Signup error:', error);
+        showUserAuthError('Signup failed. Please try again.');
+        return false;
+    }
+}
+
+async function userLogin(email, password) {
+    try {
+        const { data, error } = await supabase.auth.signInWithPassword({
+            email: email,
+            password: password
+        });
+
+        if (error) {
+            showUserAuthError(error.message);
+            return false;
+        }
+
+        if (data.user) {
+            currentUser = data.user;
+            updateUserAuthUI();
+            closeModal(userAuthModal);
+            userLoginForm.reset();
+            hideUserAuthError();
+            await loadUserVotes();
+            await loadPeople(); // Reload to show vote buttons
+            return true;
+        }
+    } catch (error) {
+        console.error('Login error:', error);
+        showUserAuthError('Login failed. Please try again.');
+        return false;
+    }
+}
+
+async function userLogout() {
+    try {
+        await supabase.auth.signOut();
+        currentUser = null;
+        userVotes = {};
+        updateUserAuthUI();
+        await loadPeople(); // Reload to hide vote buttons
+    } catch (error) {
+        console.error('Logout error:', error);
+    }
+}
+
+function showUserAuthError(message) {
+    const errorDiv = document.getElementById('userAuthError');
+    const signupErrorDiv = document.getElementById('userSignupError');
+    if (errorDiv) {
+        errorDiv.textContent = message;
+        errorDiv.style.display = 'block';
+    }
+    if (signupErrorDiv) {
+        signupErrorDiv.textContent = message;
+        signupErrorDiv.style.display = 'block';
+    }
+}
+
+function hideUserAuthError() {
+    const errorDiv = document.getElementById('userAuthError');
+    const signupErrorDiv = document.getElementById('userSignupError');
+    if (errorDiv) {
+        errorDiv.style.display = 'none';
+    }
+    if (signupErrorDiv) {
+        signupErrorDiv.style.display = 'none';
+    }
+}
+
+// Update a single person's score in real-time
+async function updatePersonScore(personId) {
+    try {
+        const newScore = await calculateScoreFromVotes(personId);
+        
+        // Update in allPeople array
+        const personIndex = allPeople.findIndex(p => p.id === personId);
+        if (personIndex !== -1) {
+            allPeople[personIndex].score = newScore;
+        }
+        
+        // Update in filteredPeople array
+        const filteredIndex = filteredPeople.findIndex(p => p.id === personId);
+        if (filteredIndex !== -1) {
+            filteredPeople[filteredIndex].score = newScore;
+        }
+        
+        // Update the UI for this specific person card
+        updatePersonCardUI(personId, newScore);
+        
+        // Update stats
+        updateStats();
+        
+        // Update featured users (only if this person might be in top 3)
+        await updateFeaturedUsersIfNeeded();
+        
+        // Update trending users
+        await loadTrendingUsers();
+    } catch (error) {
+        console.error('Error updating person score:', error);
+    }
+}
+
+// Update a specific person card in the UI
+function updatePersonCardUI(personId, newScore) {
+    const personCard = document.querySelector(`[data-person-id="${personId}"]`);
+    if (!personCard) return;
+    
+    // Update score display
+    const scoreElement = personCard.querySelector('.person-score');
+    if (scoreElement) {
+        scoreElement.textContent = `${newScore > 0 ? '+' : ''}${newScore}`;
+        scoreElement.className = `person-score ${getScoreClass(newScore)}`;
+    }
+}
+
+// Update featured users only if needed (optimized)
+async function updateFeaturedUsersIfNeeded() {
+    if (!featuredUsers) return;
+    
+    try {
+        // Simply reload featured users - it's fast and ensures accuracy
+        await loadFeaturedUsers();
+    } catch (error) {
+        console.error('Error updating featured users:', error);
+    }
+}
+
+// Vote Functions
+async function voteOnPerson(personId, voteType) {
+    if (!currentUser) {
+        openModal(userAuthModal);
+        return;
+    }
+
+    const existingVote = userVotes[personId];
+
+    try {
+        // If user already voted the same way, undo the vote (remove it)
+        if (existingVote === voteType) {
+            // Remove the vote
+            const { error } = await supabase
+                .from('votes')
+                .delete()
+                .eq('user_id', currentUser.id)
+                .eq('person_id', personId);
+
+            if (error) throw error;
+
+            // Update local state
+            delete userVotes[personId];
+        } 
+        // If user voted differently, update the vote
+        else if (existingVote) {
+            // Update existing vote
+            const { error } = await supabase
+                .from('votes')
+                .update({ vote_type: voteType })
+                .eq('user_id', currentUser.id)
+                .eq('person_id', personId);
+
+            if (error) throw error;
+
+            // Update local state
+            userVotes[personId] = voteType;
+        }
+        // If no existing vote, insert new vote
+        else {
+            const { data, error } = await supabase
+                .from('votes')
+                .insert([{
+                    user_id: currentUser.id,
+                    person_id: personId,
+                    vote_type: voteType
+                }])
+                .select()
+                .single();
+
+            if (error) {
+                if (error.code === '23505') { // Unique constraint violation (shouldn't happen, but handle it)
+                    // Try to update instead
+                    const { error: updateError } = await supabase
+                        .from('votes')
+                        .update({ vote_type: voteType })
+                        .eq('user_id', currentUser.id)
+                        .eq('person_id', personId);
+                    
+                    if (updateError) throw updateError;
+                } else {
+                    throw error;
+                }
+            }
+
+            // Update local state
+            userVotes[personId] = voteType;
+        }
+
+        // Update only this person's score in real-time (no full reload!)
+        await updatePersonScore(personId);
+        
+        // Update the vote buttons UI for this person
+        updatePersonVoteButtons(personId);
+    } catch (error) {
+        console.error('Error voting:', error);
+        alert('Error submitting vote. Please try again.');
+    }
+}
+
+// Update vote buttons UI for a specific person
+function updatePersonVoteButtons(personId) {
+    const personCard = document.querySelector(`[data-person-id="${personId}"]`);
+    if (!personCard || !currentUser) return;
+    
+    const userVote = userVotes[personId];
+    const voteButtonsContainer = personCard.querySelector('.vote-buttons');
+    
+    if (!voteButtonsContainer) return;
+    
+    // Update the buttons
+    const upButton = voteButtonsContainer.querySelector('.vote-up');
+    const downButton = voteButtonsContainer.querySelector('.vote-down');
+    
+    if (upButton) {
+        upButton.className = `vote-btn vote-up ${userVote === 'up' ? 'active' : ''}`;
+        upButton.title = userVote === 'up' ? 'Click to undo upvote' : userVote === 'down' ? 'Click to change to upvote' : 'Vote up';
+        upButton.innerHTML = `${userVote === 'up' ? '✓' : '↑'} Up`;
+    }
+    
+    if (downButton) {
+        downButton.className = `vote-btn vote-down ${userVote === 'down' ? 'active' : ''}`;
+        downButton.title = userVote === 'down' ? 'Click to undo downvote' : userVote === 'up' ? 'Click to change to downvote' : 'Vote down';
+        downButton.innerHTML = `${userVote === 'down' ? '✓' : '↓'} Down`;
+    }
 }
 
 // Admin Functions
@@ -506,7 +1108,7 @@ function editPerson(id, name, score) {
 }
 
 // News Functions
-async function loadNews() {
+async function loadNews(checkForNew = false) {
     try {
         const { data, error } = await supabase
             .from('news')
@@ -516,7 +1118,35 @@ async function loadNews() {
         if (error) throw error;
 
         if (data && data.length > 0) {
+            // Check for new news if this is a periodic check
+            if (checkForNew && lastNewsCheck && allNews.length > 0) {
+                const newNews = data.filter(news => {
+                    const newsDate = new Date(news.created_at);
+                    const lastCheckDate = new Date(lastNewsCheck);
+                    return newsDate > lastCheckDate;
+                });
+
+                if (newNews.length > 0) {
+                    // Show notification for new news
+                    showNewsNotification(newNews);
+                }
+            }
+
             allNews = data;
+            // Update last check time (set to most recent news timestamp)
+            if (data.length > 0) {
+                if (!lastNewsCheck) {
+                    // First time loading - set to most recent news
+                    lastNewsCheck = data[0].created_at;
+                } else {
+                    // Only update if we have newer news
+                    const mostRecent = new Date(data[0].created_at);
+                    const lastCheck = new Date(lastNewsCheck);
+                    if (mostRecent > lastCheck) {
+                        lastNewsCheck = data[0].created_at;
+                    }
+                }
+            }
         } else {
             allNews = [];
         }
@@ -532,15 +1162,96 @@ async function loadNews() {
     }
 }
 
+// Request notification permission and show news notification
+async function requestNotificationPermission() {
+    if (!('Notification' in window)) {
+        console.log('This browser does not support notifications');
+        return false;
+    }
+
+    if (Notification.permission === 'granted') {
+        return true;
+    }
+
+    if (Notification.permission !== 'denied') {
+        const permission = await Notification.requestPermission();
+        return permission === 'granted';
+    }
+
+    return false;
+}
+
+// Show notification for new news
+function showNewsNotification(newNewsItems) {
+    if (!('Notification' in window)) return;
+
+    // Request permission if not already granted
+    if (Notification.permission === 'default') {
+        requestNotificationPermission().then(hasPermission => {
+            if (hasPermission && newNewsItems.length > 0) {
+                showNotification(newNewsItems);
+            }
+        });
+    } else if (Notification.permission === 'granted') {
+        showNotification(newNewsItems);
+    }
+}
+
+function showNotification(newNewsItems) {
+    const latestNews = newNewsItems[0];
+    const title = newNewsItems.length === 1 
+        ? '🔴 New Breaking News!' 
+        : `🔴 ${newNewsItems.length} New News Items!`;
+    
+    const body = latestNews.text.length > 100 
+        ? latestNews.text.substring(0, 100) + '...' 
+        : latestNews.text;
+
+    new Notification(title, {
+        body: body,
+        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" fill="%23FF9000"/></svg>',
+        badge: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" fill="%23FF9000"/></svg>',
+        tag: 'auralist-news',
+        requireInteraction: false
+    });
+}
+
+// Start periodic news checking
+function startNewsNotifications() {
+    // Request permission on page load
+    requestNotificationPermission();
+
+    // Check for new news every 30 seconds
+    if (newsCheckInterval) {
+        clearInterval(newsCheckInterval);
+    }
+
+    newsCheckInterval = setInterval(async () => {
+        await loadNews(true); // Check for new news
+    }, 30000); // Check every 30 seconds
+}
+
+// Stop news notifications
+function stopNewsNotifications() {
+    if (newsCheckInterval) {
+        clearInterval(newsCheckInterval);
+        newsCheckInterval = null;
+    }
+}
+
 function renderNewsTicker() {
     if (!newsTicker) return;
 
     if (allNews.length === 0) {
-        newsTickerContainer.style.display = 'none';
+        if (newsTickerContainer) {
+            newsTickerContainer.style.display = 'none';
+        }
         return;
     }
 
-    newsTickerContainer.style.display = 'flex';
+    if (newsTickerContainer) {
+        newsTickerContainer.style.display = 'flex';
+    }
     
     // Create duplicate items for seamless loop
     const newsItems = allNews.map(news => 
@@ -579,6 +1290,9 @@ async function addNews(text) {
 
         await loadNews();
         newsForm.reset();
+        
+        // Trigger notification for the new news (if other users are viewing)
+        // The periodic check will catch it for other users
     } catch (error) {
         console.error('Error adding news:', error);
         alert('Error adding news. Make sure the news table exists in Supabase!');
@@ -616,6 +1330,76 @@ function closeModal(modal) {
 
 // Setup event listeners
 function setupEventListeners() {
+    // User auth button
+    if (userAuthBtn) {
+        userAuthBtn.addEventListener('click', () => {
+            if (currentUser) {
+                userLogout();
+            } else {
+                openModal(userAuthModal);
+            }
+        });
+    }
+
+    // User login/signup tab switching
+    const loginTabBtn = document.getElementById('loginTabBtn');
+    const signupTabBtn = document.getElementById('signupTabBtn');
+    
+    if (loginTabBtn) {
+        loginTabBtn.addEventListener('click', () => {
+            loginTabBtn.classList.add('active');
+            signupTabBtn.classList.remove('active');
+            userLoginForm.style.display = 'block';
+            userSignupForm.style.display = 'none';
+            hideUserAuthError();
+        });
+    }
+    
+    if (signupTabBtn) {
+        signupTabBtn.addEventListener('click', () => {
+            signupTabBtn.classList.add('active');
+            loginTabBtn.classList.remove('active');
+            userSignupForm.style.display = 'block';
+            userLoginForm.style.display = 'none';
+            hideUserAuthError();
+        });
+    }
+
+    // User login form
+    if (userLoginForm) {
+        userLoginForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const email = document.getElementById('userEmail').value;
+            const password = document.getElementById('userPassword').value;
+            await userLogin(email, password);
+        });
+    }
+
+    // User signup form
+    if (userSignupForm) {
+        userSignupForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const email = document.getElementById('signupEmail').value;
+            const password = document.getElementById('signupPassword').value;
+            const confirmPassword = document.getElementById('signupPasswordConfirm').value;
+            await userSignup(email, password, confirmPassword);
+        });
+    }
+
+    // Cancel user auth buttons
+    const cancelUserAuthBtn = document.getElementById('cancelUserAuthBtn');
+    const cancelSignupBtn = document.getElementById('cancelSignupBtn');
+    if (cancelUserAuthBtn) {
+        cancelUserAuthBtn.addEventListener('click', () => {
+            closeModal(userAuthModal);
+        });
+    }
+    if (cancelSignupBtn) {
+        cancelSignupBtn.addEventListener('click', () => {
+            closeModal(userAuthModal);
+        });
+    }
+
     // Admin button
     adminBtn.addEventListener('click', () => {
         if (isAdmin) {
@@ -625,7 +1409,7 @@ function setupEventListeners() {
         }
     });
 
-    // Login form
+    // Admin login form
     loginForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const email = document.getElementById('adminEmail').value;
@@ -676,6 +1460,7 @@ function setupEventListeners() {
     // Close modals when clicking outside
     window.addEventListener('click', (e) => {
         if (e.target === loginModal) closeModal(loginModal);
+        if (e.target === userAuthModal) closeModal(userAuthModal);
         if (e.target === editModal) {
             closeModal(editModal);
             editingPersonId = null;
@@ -737,6 +1522,7 @@ function setupEventListeners() {
 window.editPerson = editPerson;
 window.deletePerson = deletePerson;
 window.deleteNews = deleteNews;
+window.voteOnPerson = voteOnPerson;
 
 // Escape HTML to prevent XSS
 function escapeHtml(text) {
