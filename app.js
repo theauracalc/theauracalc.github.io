@@ -222,12 +222,14 @@ async function loadPeople() {
 
 // Calculate score from votes using a fair formula
 // Formula considers both approval ratio and total votes for fairness
+// Only counts the most recent vote per user (allows 24-hour voting reset)
 async function calculateScoreFromVotes(personId) {
     try {
         const { data: votes, error } = await supabase
             .from('votes')
-            .select('vote_type')
-            .eq('person_id', personId);
+            .select('vote_type, user_id, created_at')
+            .eq('person_id', personId)
+            .order('created_at', { ascending: false });
 
         if (error) throw error;
 
@@ -239,10 +241,18 @@ async function calculateScoreFromVotes(personId) {
             return BASE_SCORE;
         }
 
-        // Count upvotes and downvotes
+        // Get only the most recent vote per user (to handle 24-hour voting reset)
+        const mostRecentVotesByUser = {};
+        votes.forEach(vote => {
+            if (!mostRecentVotesByUser[vote.user_id]) {
+                mostRecentVotesByUser[vote.user_id] = vote;
+            }
+        });
+
+        // Count upvotes and downvotes from most recent votes only
         let upvotes = 0;
         let downvotes = 0;
-        votes.forEach(vote => {
+        Object.values(mostRecentVotesByUser).forEach(vote => {
             if (vote.vote_type === 'up') {
                 upvotes += 1;
             } else if (vote.vote_type === 'down') {
@@ -286,7 +296,7 @@ async function calculateScoreFromVotes(personId) {
     }
 }
 
-// Get upvote count for a person
+// Get upvote count for a person (only counts most recent vote per user)
 async function getUpvoteCount(personId) {
     // If no personId (e.g., from initialData fallback), return 0
     if (!personId) return 0;
@@ -294,12 +304,31 @@ async function getUpvoteCount(personId) {
     try {
         const { data: votes, error } = await supabase
             .from('votes')
-            .select('vote_type')
+            .select('vote_type, user_id, created_at')
             .eq('person_id', personId)
-            .eq('vote_type', 'up');
+            .order('created_at', { ascending: false });
 
         if (error) throw error;
-        return votes ? votes.length : 0;
+        
+        if (!votes || votes.length === 0) return 0;
+        
+        // Get only the most recent vote per user
+        const mostRecentVotesByUser = {};
+        votes.forEach(vote => {
+            if (!mostRecentVotesByUser[vote.user_id]) {
+                mostRecentVotesByUser[vote.user_id] = vote;
+            }
+        });
+        
+        // Count only upvotes from most recent votes
+        let upvoteCount = 0;
+        Object.values(mostRecentVotesByUser).forEach(vote => {
+            if (vote.vote_type === 'up') {
+                upvoteCount += 1;
+            }
+        });
+        
+        return upvoteCount;
     } catch (error) {
         console.error('Error getting upvote count:', error);
         return 0;
@@ -457,15 +486,31 @@ async function loadUserVotes() {
     try {
         const { data, error } = await supabase
             .from('votes')
-            .select('person_id, vote_type')
-            .eq('user_id', currentUser.id);
+            .select('person_id, vote_type, created_at')
+            .eq('user_id', currentUser.id)
+            .order('created_at', { ascending: false });
 
         if (error) throw error;
 
         userVotes = {};
+        const now = new Date();
+        const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
         if (data) {
+            // Group by person_id and get the most recent vote
+            const votesByPerson = {};
             data.forEach(vote => {
-                userVotes[vote.person_id] = vote.vote_type;
+                if (!votesByPerson[vote.person_id]) {
+                    votesByPerson[vote.person_id] = vote;
+                }
+            });
+
+            // Only include votes that are less than 24 hours old
+            Object.values(votesByPerson).forEach(vote => {
+                const voteDate = new Date(vote.created_at);
+                if (voteDate > twentyFourHoursAgo) {
+                    userVotes[vote.person_id] = vote.vote_type;
+                }
             });
         }
 
@@ -928,39 +973,72 @@ async function voteOnPerson(personId, voteType) {
         return;
     }
 
-    const existingVote = userVotes[personId];
-
     try {
-        // If user already voted the same way, undo the vote (remove it)
-        if (existingVote === voteType) {
+        // Check if user has an existing vote for this person (get most recent)
+        const { data: existingVotesData, error: fetchError } = await supabase
+            .from('votes')
+            .select('id, vote_type, created_at')
+            .eq('user_id', currentUser.id)
+            .eq('person_id', personId)
+            .order('created_at', { ascending: false })
+            .limit(1);
+        
+        const existingVote = existingVotesData && existingVotesData.length > 0 ? existingVotesData[0] : null;
+
+        if (fetchError && fetchError.code !== 'PGRST116') {
+            // PGRST116 means no rows found, which is fine
+            throw fetchError;
+        }
+
+        const now = new Date();
+        const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        
+        let canVoteAgain = true;
+        
+        if (existingVote) {
+            const voteDate = new Date(existingVote.created_at);
+            canVoteAgain = voteDate <= twentyFourHoursAgo;
+        }
+
+        // If user already voted the same way within 24 hours, undo the vote (remove it)
+        if (existingVote && !canVoteAgain && existingVote.vote_type === voteType) {
             // Remove the vote
             const { error } = await supabase
                 .from('votes')
                 .delete()
-                .eq('user_id', currentUser.id)
-                .eq('person_id', personId);
+                .eq('id', existingVote.id);
 
             if (error) throw error;
 
             // Update local state
             delete userVotes[personId];
         } 
-        // If user voted differently, update the vote
-        else if (existingVote) {
+        // If user voted differently within 24 hours, update the vote
+        else if (existingVote && !canVoteAgain && existingVote.vote_type !== voteType) {
             // Update existing vote
             const { error } = await supabase
                 .from('votes')
                 .update({ vote_type: voteType })
-                .eq('user_id', currentUser.id)
-                .eq('person_id', personId);
+                .eq('id', existingVote.id);
 
             if (error) throw error;
 
             // Update local state
             userVotes[personId] = voteType;
         }
-        // If no existing vote, insert new vote
+        // If no existing vote OR it's been more than 24 hours, insert/update vote
         else {
+            if (existingVote && canVoteAgain) {
+                // Delete old vote and create new one (resets the 24-hour timer)
+                const { error: deleteError } = await supabase
+                    .from('votes')
+                    .delete()
+                    .eq('id', existingVote.id);
+                
+                if (deleteError) throw deleteError;
+            }
+
+            // Insert new vote (or re-insert after deletion)
             const { data, error } = await supabase
                 .from('votes')
                 .insert([{
@@ -972,11 +1050,11 @@ async function voteOnPerson(personId, voteType) {
                 .single();
 
             if (error) {
-                if (error.code === '23505') { // Unique constraint violation (shouldn't happen, but handle it)
+                if (error.code === '23505') { // Unique constraint violation
                     // Try to update instead
                     const { error: updateError } = await supabase
                         .from('votes')
-                        .update({ vote_type: voteType })
+                        .update({ vote_type: voteType, created_at: new Date().toISOString() })
                         .eq('user_id', currentUser.id)
                         .eq('person_id', personId);
                     
@@ -995,6 +1073,9 @@ async function voteOnPerson(personId, voteType) {
         
         // Update the vote buttons UI for this person
         updatePersonVoteButtons(personId);
+        
+        // Reload user votes to refresh the state
+        await loadUserVotes();
     } catch (error) {
         console.error('Error voting:', error);
         alert('Error submitting vote. Please try again.');
