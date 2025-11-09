@@ -1465,16 +1465,37 @@ function renderNewsTicker() {
     }
 
     if (newsTickerContainer) {
-        newsTickerContainer.style.display = 'flex';
+        newsTickerContainer.style.display = 'block';
     }
     
-    // Create duplicate items for seamless loop
+    // Create news items with separators
     const newsItems = allNews.map(news => 
         `<span class="news-item">${escapeHtml(news.text)}</span>`
     ).join('<span class="news-separator"> • </span>');
     
-    // Duplicate for seamless scrolling
-    newsTicker.innerHTML = newsItems + '<span class="news-separator"> • </span>' + newsItems;
+    if (!newsItems || newsItems.trim() === '') {
+        if (newsTickerContainer) {
+            newsTickerContainer.style.display = 'none';
+        }
+        return;
+    }
+    
+    // For seamless infinite scroll, we need multiple copies
+    // The animation starts from viewport width and moves to negative content width
+    const separator = '<span class="news-separator"> • </span>';
+    // Create enough copies to ensure smooth looping (at least 3-4 copies)
+    const duplicatedContent = newsItems + separator + newsItems + separator + newsItems + separator + newsItems;
+    
+    // Set content
+    newsTicker.textContent = ''; // Clear first
+    newsTicker.innerHTML = duplicatedContent;
+    
+    // Calculate animation duration based on content length (optional - for consistent speed)
+    // For now, use fixed duration
+    newsTicker.style.animation = 'scroll-ticker 30s linear infinite';
+    
+    // Force animation restart
+    newsTicker.style.animationPlayState = 'running';
 }
 
 function renderNewsList() {
@@ -1920,13 +1941,23 @@ async function cleanupOldChatMessages() {
     }
 }
 
-// Modal functions
+// Modal functions - Optimized for mobile
 function openModal(modal) {
+    if (!modal) return;
     modal.classList.add('show');
+    // Prevent body scroll on mobile when modal is open
+    document.body.style.overflow = 'hidden';
+    // Scroll to top of modal on mobile
+    if (window.innerWidth <= 768) {
+        modal.scrollTop = 0;
+    }
 }
 
 function closeModal(modal) {
+    if (!modal) return;
     modal.classList.remove('show');
+    // Restore body scroll
+    document.body.style.overflow = '';
 }
 
 // Setup event listeners
@@ -2136,7 +2167,7 @@ function setupEventListeners() {
         });
     });
 
-    // Close modals when clicking outside
+    // Close modals when clicking outside (optimized for touch devices)
     window.addEventListener('click', (e) => {
         if (e.target === loginModal) closeModal(loginModal);
         if (e.target === userAuthModal) closeModal(userAuthModal);
@@ -2144,7 +2175,21 @@ function setupEventListeners() {
             closeModal(editModal);
             editingPersonId = null;
         }
+        if (e.target === usernameModal) closeModal(usernameModal);
+        if (e.target === newsModal) closeModal(newsModal);
     });
+    
+    // Touch event for mobile (better than click for modals)
+    window.addEventListener('touchend', (e) => {
+        if (e.target === loginModal) closeModal(loginModal);
+        if (e.target === userAuthModal) closeModal(userAuthModal);
+        if (e.target === editModal) {
+            closeModal(editModal);
+            editingPersonId = null;
+        }
+        if (e.target === usernameModal) closeModal(usernameModal);
+        if (e.target === newsModal) closeModal(newsModal);
+    }, { passive: true });
 
     // Filter and search listeners
     searchInput.addEventListener('input', (e) => {
