@@ -228,13 +228,18 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
 
     // Calculate score from votes using a fair formula
     // Formula considers both approval ratio and total votes for fairness
-    // Only counts the most recent vote per user (allows 24-hour voting reset)
+    // Only counts votes from the current voting period (since last 9:30 PM France time reset)
     async function calculateScoreFromVotes(personId) {
         try {
+            // Get the start of the current voting period (9:30 PM France time)
+            const votingPeriodStart = getCurrentVotingPeriodStartUTC();
+            
+            // Only get votes from the current voting period
             const { data: votes, error } = await supabase
                 .from('votes')
                 .select('vote_type, user_id, created_at')
                 .eq('person_id', personId)
+                .gte('created_at', votingPeriodStart.toISOString())
                 .order('created_at', { ascending: false });
 
             if (error) throw error;
@@ -243,12 +248,12 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
             const BASE_SCORE = 150;
             
             if (!votes || votes.length === 0) {
-                // If no votes, return base score of 150
+                // If no votes in current period, return base score of 150
                 return BASE_SCORE;
             }
 
-            // Get only the most recent vote per user (handles daily voting reset - counts all historical votes)
-            // This ensures scores accumulate over time while allowing daily re-voting
+            // Get only the most recent vote per user from current voting period
+            // This handles cases where a user voted multiple times in the same period
             const mostRecentVotesByUser = {};
             votes.forEach(vote => {
                 if (!mostRecentVotesByUser[vote.user_id]) {
@@ -256,7 +261,7 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
                 }
             });
 
-            // Count upvotes and downvotes from most recent votes only
+            // Count upvotes and downvotes from most recent votes in current period only
             let upvotes = 0;
             let downvotes = 0;
             Object.values(mostRecentVotesByUser).forEach(vote => {
@@ -303,23 +308,28 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
         }
     }
 
-    // Get upvote count for a person (only counts most recent vote per user)
+    // Get upvote count for a person (only counts votes from current voting period)
     async function getUpvoteCount(personId) {
         // If no personId (e.g., from initialData fallback), return 0
         if (!personId) return 0;
         
         try {
+            // Get the start of the current voting period (9:30 PM France time)
+            const votingPeriodStart = getCurrentVotingPeriodStartUTC();
+            
+            // Only get votes from the current voting period
             const { data: votes, error } = await supabase
                 .from('votes')
                 .select('vote_type, user_id, created_at')
                 .eq('person_id', personId)
+                .gte('created_at', votingPeriodStart.toISOString())
                 .order('created_at', { ascending: false });
 
             if (error) throw error;
             
             if (!votes || votes.length === 0) return 0;
             
-            // Get only the most recent vote per user
+            // Get only the most recent vote per user from current voting period
             const mostRecentVotesByUser = {};
             votes.forEach(vote => {
                 if (!mostRecentVotesByUser[vote.user_id]) {
@@ -327,7 +337,7 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
                 }
             });
             
-            // Count only upvotes from most recent votes
+            // Count only upvotes from most recent votes in current period
             let upvoteCount = 0;
             Object.values(mostRecentVotesByUser).forEach(vote => {
                 if (vote.vote_type === 'up') {
@@ -491,7 +501,7 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
     function getCurrentVotingPeriodStartUTC() {
         const now = new Date();
         
-        // Get current time components in France timezone (Europe/Paris)
+        // Get current time in France timezone
         const franceFormatter = new Intl.DateTimeFormat('en-US', {
             timeZone: 'Europe/Paris',
             year: 'numeric',
@@ -533,50 +543,46 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
             }
         }
         
-        // Use a reliable method to convert 9:30 PM France time to UTC
-        // Method: Create a date string and use Intl to calculate the UTC equivalent
-        // This properly handles DST (Daylight Saving Time) changes automatically
+        // Convert 9:30 PM France time to UTC
+        // Use a reliable iterative method to find the exact UTC time
         
-        // Create an ISO string for 9:30 PM on the reset day
-        const resetDateStr = `${resetYear}-${String(resetMonth + 1).padStart(2, '0')}-${String(resetDay).padStart(2, '0')}T21:30:00`;
+        // Start with an estimate: create a date for 9:30 PM on the reset day
+        // We'll iteratively adjust until we find the UTC time that represents 9:30 PM France time
+        let candidateUTC = new Date(resetYear, resetMonth, resetDay, 21, 30, 0);
         
-        // Use a workaround: create a date and calculate what UTC time corresponds to this France time
-        // We'll use the fact that we can format a date in both timezones to get the offset
+        // Refine the candidate by checking what France time it represents
+        // We'll do up to 3 iterations to account for DST and timezone complexities
+        for (let i = 0; i < 3; i++) {
+            const franceTimeStr = candidateUTC.toLocaleString('en-US', {
+                timeZone: 'Europe/Paris',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
+            });
+            
+            const parts = franceTimeStr.split(', ');
+            const timePart = parts[1].split(':');
+            const franceHour = parseInt(timePart[0]);
+            const franceMinute = parseInt(timePart[1]);
+            
+            // If we've found the exact time (9:30 PM), we're done
+            if (franceHour === 21 && franceMinute === 30) {
+                break;
+            }
+            
+            // Calculate how far off we are and adjust
+            const targetMinutes = 21 * 60 + 30;
+            const actualMinutes = franceHour * 60 + franceMinute;
+            const diffMinutes = targetMinutes - actualMinutes;
+            
+            // Adjust the candidate UTC time
+            candidateUTC = new Date(candidateUTC.getTime() + (diffMinutes * 60 * 1000));
+        }
         
-        // Create a date object for the reset time (treating it as if it were in France timezone)
-        // We'll use a reference date to calculate the timezone offset
-        const testDate = new Date(resetYear, resetMonth, resetDay, 12, 0, 0); // Noon on reset day
-        
-        // Get what time this represents in France timezone
-        const franceTestStr = testDate.toLocaleString('en-US', { timeZone: 'Europe/Paris', hour12: false });
-        const utcTestStr = testDate.toLocaleString('en-US', { timeZone: 'UTC', hour12: false });
-        
-        // Parse both to get the offset
-        const parseTimeStr = (str) => {
-            // Format: "M/D/YYYY, HH:mm:ss"
-            const [datePart, timePart] = str.split(', ');
-            const [m, d, y] = datePart.split('/');
-            const [h, min, s] = timePart.split(':');
-            return { year: parseInt(y), month: parseInt(m) - 1, day: parseInt(d), hour: parseInt(h), minute: parseInt(min) };
-        };
-        
-        const franceTest = parseTimeStr(franceTestStr);
-        const utcTest = parseTimeStr(utcTestStr);
-        
-        // Create Date objects from the parsed times
-        const franceDate = new Date(franceTest.year, franceTest.month, franceTest.day, franceTest.hour, franceTest.minute);
-        const utcDate = new Date(utcTest.year, utcTest.month, utcTest.day, utcTest.hour, utcTest.minute);
-        
-        // Calculate offset: difference between France time and UTC for this date
-        const offsetMs = franceDate.getTime() - utcDate.getTime();
-        
-        // Now create the actual reset time (9:30 PM France time)
-        const franceResetTime = new Date(resetYear, resetMonth, resetDay, 21, 30, 0, 0);
-        
-        // Convert to UTC by subtracting the offset
-        const utcResetDate = new Date(franceResetTime.getTime() - offsetMs);
-        
-        return utcResetDate;
+        return candidateUTC;
     }
     
     // Load user's votes to show which people they've voted on (only current voting period)
