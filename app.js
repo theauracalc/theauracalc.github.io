@@ -228,18 +228,15 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
 
     // Calculate score from votes using a fair formula
     // Formula considers both approval ratio and total votes for fairness
-    // Only counts votes from the current voting period (since last 9:30 PM France time reset)
+    // Counts ALL historical votes (most recent per user) - scores persist across voting periods
+    // The 9:30 PM reset only affects whether users can vote again, not the scores
     async function calculateScoreFromVotes(personId) {
         try {
-            // Get the start of the current voting period (9:30 PM France time)
-            const votingPeriodStart = getCurrentVotingPeriodStartUTC();
-            
-            // Only get votes from the current voting period
+            // Get ALL votes (not filtered by period - scores should persist)
             const { data: votes, error } = await supabase
                 .from('votes')
                 .select('vote_type, user_id, created_at')
                 .eq('person_id', personId)
-                .gte('created_at', votingPeriodStart.toISOString())
                 .order('created_at', { ascending: false });
 
             if (error) throw error;
@@ -248,12 +245,12 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
             const BASE_SCORE = 150;
             
             if (!votes || votes.length === 0) {
-                // If no votes in current period, return base score of 150
+                // If no votes, return base score of 150
                 return BASE_SCORE;
             }
 
-            // Get only the most recent vote per user from current voting period
-            // This handles cases where a user voted multiple times in the same period
+            // Get only the most recent vote per user (across all time)
+            // This ensures scores accumulate over time while allowing daily re-voting
             const mostRecentVotesByUser = {};
             votes.forEach(vote => {
                 if (!mostRecentVotesByUser[vote.user_id]) {
@@ -261,7 +258,7 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
                 }
             });
 
-            // Count upvotes and downvotes from most recent votes in current period only
+            // Count upvotes and downvotes from most recent votes (all historical votes)
             let upvotes = 0;
             let downvotes = 0;
             Object.values(mostRecentVotesByUser).forEach(vote => {
@@ -308,28 +305,24 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
         }
     }
 
-    // Get upvote count for a person (only counts votes from current voting period)
+    // Get upvote count for a person (counts all historical votes, most recent per user)
     async function getUpvoteCount(personId) {
         // If no personId (e.g., from initialData fallback), return 0
         if (!personId) return 0;
         
         try {
-            // Get the start of the current voting period (9:30 PM France time)
-            const votingPeriodStart = getCurrentVotingPeriodStartUTC();
-            
-            // Only get votes from the current voting period
+            // Get ALL votes (not filtered by period - upvotes should persist)
             const { data: votes, error } = await supabase
                 .from('votes')
                 .select('vote_type, user_id, created_at')
                 .eq('person_id', personId)
-                .gte('created_at', votingPeriodStart.toISOString())
                 .order('created_at', { ascending: false });
 
             if (error) throw error;
             
             if (!votes || votes.length === 0) return 0;
             
-            // Get only the most recent vote per user from current voting period
+            // Get only the most recent vote per user (across all time)
             const mostRecentVotesByUser = {};
             votes.forEach(vote => {
                 if (!mostRecentVotesByUser[vote.user_id]) {
@@ -337,7 +330,7 @@ let userVotesRefreshInterval = null; // Interval for refreshing user votes (to c
                 }
             });
             
-            // Count only upvotes from most recent votes in current period
+            // Count only upvotes from most recent votes (all historical votes)
             let upvoteCount = 0;
             Object.values(mostRecentVotesByUser).forEach(vote => {
                 if (vote.vote_type === 'up') {
