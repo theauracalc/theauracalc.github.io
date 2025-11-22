@@ -2,7 +2,9 @@ const SUPABASE_URL = 'https://sxhsqkyhflepeaexvqmh.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN4aHNxa3loZmxlcGVhZXh2cW1oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjI0NTUxNDMsImV4cCI6MjA3ODAzMTE0M30.s2EmGHQr8Ijrs71VHIlEXzagJrUDvOC4y-hY0wOkP0A';
 
 // YOUR ADMIN ID
-const ADMIN_USER_ID = '50351ca7-3c14-4095-99a9-e6cbb4e6482a'; 
+const ADMIN_USER_ID = 'your-actual-supabase-user-id-here'; 
+// Cooldown constant (5 seconds)
+const VOTE_COOLDOWN_MS = 5000; 
 
 const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -20,12 +22,12 @@ document.addEventListener('DOMContentLoaded', () => {
     // 1. Setup listeners immediately so buttons work even if data is loading
     setupListeners();
 
-    // 2. Visual Feedback: Let user know we are connecting
+    // 2. Visual Feedback: Set initial chat placeholder
     const chatInput = document.getElementById('chatInput');
-    if(chatInput) chatInput.placeholder = "Connecting to secure channel...";
+    if(chatInput) chatInput.placeholder = "Verifying identity...";
 
-    // 3. PARALLEL LOADING (The Fix)
-    // We fire all requests at the same time instead of waiting for one to finish before starting the next.
+    // 3. PARALLEL LOADING 
+    // Fire all requests at the same time.
     Promise.all([
         loadSettings(),
         loadPeople(),
@@ -33,11 +35,11 @@ document.addEventListener('DOMContentLoaded', () => {
         loadChat(),
         initAuth() // Auth runs in parallel with data loading
     ]).then(() => {
-        setupRealtime(); // Connect realtime last
+        setupRealtime(); 
     });
 });
 
-// --- CORE VOTING LOGIC ---
+// --- CORE VOTING LOGIC (UPDATED for base_score) ---
 
 async function voteOnPerson(personId, voteType) {
     if (!appState.currentUser) {
@@ -45,15 +47,23 @@ async function voteOnPerson(personId, voteType) {
         return;
     }
 
+    const lastVoteKey = `lastVote_${appState.currentUser.id}_${personId}`;
+    const lastVoteTime = localStorage.getItem(lastVoteKey);
+    const now = Date.now();
+
+    // Check Cooldown
+    if (lastVoteTime && now - lastVoteTime < VOTE_COOLDOWN_MS) {
+        console.warn('Voting cooldown active. Please wait.');
+        return; 
+    }
+
     const previousVote = appState.userVotes[personId];
     let isStale = false;
     if (previousVote && new Date(previousVote.created_at) < appState.lastGlobalReset) isStale = true;
 
-    // Optimistic UI update (Instant click feel)
-    // We don't wait for database to update UI color
-    // (Actual re-render happens after DB confirms, but this makes it feel snappy)
-    
     try {
+        localStorage.setItem(lastVoteKey, now);
+
         if (previousVote && !isStale) {
             if (previousVote.vote_type === voteType) {
                 await supabase.from('votes').delete().eq('id', previousVote.id);
@@ -74,19 +84,28 @@ async function voteOnPerson(personId, voteType) {
         await refreshPersonScore(personId);
     } catch (error) {
         console.error("Voting error:", error);
+        localStorage.removeItem(lastVoteKey); 
     }
 }
 
+// UPDATED: Now uses base_score + net votes
 async function refreshPersonScore(personId) {
     const { count: ups } = await supabase.from('votes').select('*', { count: 'exact', head: true }).eq('person_id', personId).eq('vote_type', 'up');
     const { count: downs } = await supabase.from('votes').select('*', { count: 'exact', head: true }).eq('person_id', personId).eq('vote_type', 'down');
+    
+    // Find the person's base score (Must be refetched if loadPeople() hasn't finished)
+    let person = appState.people.find(p => p.id == personId);
+    if (!person) {
+        const { data } = await supabase.from('people').select('base_score').eq('id', personId).single();
+        if (data) person = data; else return;
+    }
 
-    const newScore = 150 + ((ups - downs) * 5); 
+    // New Score = Base Score (Admin/Initial) + (NetVotes * 5)
+    const newScore = person.base_score + ((ups - downs) * 5); 
     
     await supabase.from('people').update({ score: newScore }).eq('id', personId);
     
-    const p = appState.people.find(x => x.id == personId);
-    if(p) p.score = newScore;
+    if(person) person.score = newScore;
     renderPeopleList();
     updateStats();
 }
@@ -94,7 +113,8 @@ async function refreshPersonScore(personId) {
 // --- DATA & UI RENDERING ---
 
 async function loadPeople() {
-    const { data } = await supabase.from('people').select('*');
+    // Ensure we select the new base_score column
+    const { data } = await supabase.from('people').select('*, base_score'); 
     if (data) {
         appState.people = data;
         renderPeopleList();
@@ -104,8 +124,8 @@ async function loadPeople() {
 
 function renderPeopleList() {
     const container = document.getElementById('peopleList');
-    const filterTxt = document.getElementById('searchInput').value.toLowerCase();
-    const sortMode = document.getElementById('sortFilter').value;
+    const filterTxt = document.getElementById('searchInput')?.value.toLowerCase() || '';
+    const sortMode = document.getElementById('sortFilter')?.value || 'name_asc';
 
     let filtered = appState.people.filter(p => p.name.toLowerCase().includes(filterTxt));
 
@@ -124,11 +144,13 @@ function renderPeopleList() {
 
         const scoreClass = p.score > 150 ? 'score-pos' : (p.score < 150 ? 'score-neg' : 'score-neu');
 
+        // Added base_score to the card template for debugging (can be removed later)
         return `
             <div class="person-card">
                 <div class="card-info">
                     <div class="person-name">${escapeHtml(p.name)}</div>
                     <div class="person-score ${scoreClass}">${p.score}</div>
+                    ${appState.isAdmin ? `<small>Base: ${p.base_score}</small>` : ''} 
                 </div>
                 <div class="vote-actions">
                     <button class="vote-btn up ${voteType === 'up' ? 'active' : ''}" onclick="voteOnPerson(${p.id}, 'up')">Up</button>
@@ -143,7 +165,7 @@ function renderPeopleList() {
     }).join('');
 }
 
-// --- ADMIN FEATURES ---
+// --- ADMIN FEATURES (UPDATED for base_score) ---
 
 function openEditModal(personId = null) {
     const title = document.getElementById('editModalTitle');
@@ -155,7 +177,8 @@ function openEditModal(personId = null) {
         const person = appState.people.find(p => p.id === personId);
         title.innerText = "Edit Person";
         nameInput.value = person.name;
-        scoreInput.value = person.score;
+        // Admin edits the score, which will become the new base
+        scoreInput.value = person.score; 
         idInput.value = person.id;
     } else {
         title.innerText = "Add Person";
@@ -166,25 +189,35 @@ function openEditModal(personId = null) {
     openModal('editModal');
 }
 
+// UPDATED: Admin edit now writes to base_score
 async function handlePersonSubmit(e) {
     e.preventDefault();
     const name = document.getElementById('personName').value;
     const score = parseInt(document.getElementById('personScore').value);
     const id = document.getElementById('personId').value;
+    
+    // Admin changes the score/base_score
+    const updatePayload = { name: name, score: score, base_score: score };
 
     if (id) {
-        const { error } = await supabase.from('people').update({ name, score }).eq('id', id);
+        // Update existing
+        const { error } = await supabase.from('people').update(updatePayload).eq('id', id);
         if (!error) {
+            // Update local state instantly
             const p = appState.people.find(x => x.id == id);
-            if(p) { p.name = name; p.score = score; }
+            if(p) { p.name = name; p.score = score; p.base_score = score; }
         }
     } else {
-        await supabase.from('people').insert({ name, score, approved: true });
+        // Create new
+        const { error } = await supabase.from('people').insert({ name, score, base_score: score, approved: true });
     }
     
     closeModal();
-    loadPeople();
+    // Re-render everything with the updated scores/bases
+    loadPeople(); 
 }
+
+// ... (rest of admin/utility functions are unchanged or included below for completeness) ...
 
 async function deletePerson(id) {
     if(confirm("Delete this person?")) { 
@@ -199,8 +232,8 @@ async function loadNews() {
     if(data && data.length) {
         const newsItems = data.map(n => `<span class="news-item">${escapeHtml(n.text)}</span>`).join('');
         let content = newsItems; for(let i=0; i<10; i++) content += newsItems;
-        track.innerHTML = content;
-    } else {
+        if(track) track.innerHTML = content;
+    } else if(track) {
         track.innerHTML = '<span class="news-item">Welcome to The Auralist •</span>'.repeat(10);
     }
 
@@ -226,7 +259,7 @@ async function deleteNews(id) {
     loadNews();
 }
 
-// --- AUTH (OPTIMIZED) ---
+// --- AUTH (FIXES BUG 1 & 3) ---
 
 async function initAuth() {
     const { data: { session } } = await supabase.auth.getSession();
@@ -234,10 +267,12 @@ async function initAuth() {
         await handleUserLogin(session.user);
     } else {
         // Not logged in: Chat remains visible but disabled
-        document.getElementById('chatInput').placeholder = "Login to chat";
+        const chatInput = document.getElementById('chatInput');
+        if(chatInput) chatInput.placeholder = "Login to chat";
     }
 }
 
+// FIXED: Removed redundant openModal calls on profile fetch failure
 async function handleUserLogin(user) {
     appState.currentUser = user;
     document.getElementById('userAuthBtn').innerText = 'Sign Out';
@@ -255,18 +290,24 @@ async function handleUserLogin(user) {
 
     if(votesRes.data) votesRes.data.forEach(v => appState.userVotes[v.person_id] = v);
     
+    const chatInput = document.getElementById('chatInput');
+    const chatSendBtn = document.getElementById('chatSendBtn');
+
     if (profileRes.data) {
         appState.username = profileRes.data.username;
-        document.getElementById('chatInput').disabled = false;
-        document.getElementById('chatSendBtn').disabled = false;
-        document.getElementById('chatInput').placeholder = "Join the conversation...";
+        if(chatInput) chatInput.disabled = false;
+        if(chatSendBtn) chatSendBtn.disabled = false;
+        if(chatInput) chatInput.placeholder = "Join the conversation...";
     } else {
-        openModal('userAuthModal');
+        // User logged in but profile/username missing. (FIXES Bug 1)
+        // We do NOT open the login modal again. We only disable chat (FIXES Bug 3)
+        if(chatInput) chatInput.placeholder = "Profile required to chat (See Sign Up tab)";
+        if(chatInput) chatInput.disabled = true;
+        if(chatSendBtn) chatSendBtn.disabled = true;
     }
     
-    // Re-render UI now that we know who the user is (update vote buttons colors and chat sides)
     renderPeopleList();
-    renderChatList(lastLoadedChatMessages); // Uses cached chat messages to fix alignment
+    renderChatList(lastLoadedChatMessages); 
 }
 
 // --- LISTENERS ---
@@ -286,11 +327,16 @@ function setupListeners() {
     document.getElementById('addPersonBtn').onclick = () => openEditModal(null);
     
     document.getElementById('manageNewsBtn').onclick = () => openModal('newsModal');
-    document.getElementById('newsForm').onsubmit = (e) => { e.preventDefault(); addNews(); };
-    document.getElementById('chatForm').onsubmit = sendChat;
+    const newsForm = document.getElementById('newsForm');
+    if (newsForm) newsForm.onsubmit = (e) => { e.preventDefault(); addNews(); };
+    const chatForm = document.getElementById('chatForm');
+    if (chatForm) chatForm.onsubmit = sendChat;
     
-    document.getElementById('searchInput').oninput = renderPeopleList;
-    document.getElementById('sortFilter').onchange = renderPeopleList;
+    const searchInput = document.getElementById('searchInput');
+    if (searchInput) searchInput.oninput = renderPeopleList;
+    const sortFilter = document.getElementById('sortFilter');
+    if (sortFilter) sortFilter.onchange = renderPeopleList;
+    
     document.querySelectorAll('.close-btn').forEach(b => b.onclick = () => closeModal(b.closest('.modal').id));
 }
 
@@ -305,12 +351,12 @@ async function loginUser(email, password) { const { error } = await supabase.aut
 async function signupUser(email, password, username) { if(password.length<6) return document.getElementById('signupError').innerText="Pass too short"; const { data, error } = await supabase.auth.signUp({ email, password }); if(error) return document.getElementById('signupError').innerText = error.message; if(data.user) { await supabase.from('user_profiles').insert([{ user_id: data.user.id, username }]); document.getElementById('tabLogin').click(); } }
 async function loadSettings() { const { data } = await supabase.from('app_settings').select('value').eq('key', 'last_voting_reset').single(); appState.lastGlobalReset = data ? new Date(data.value) : new Date(0); }
 async function resetVoting() { if(!confirm("Start new round?")) return; const now = new Date().toISOString(); await supabase.from('app_settings').upsert({key:'last_voting_reset', value:now}); appState.lastGlobalReset = new Date(now); appState.userVotes = {}; renderPeopleList(); }
-async function handleAdminLogin(e) { e.preventDefault(); const { data } = await supabase.auth.signInWithPassword({ email: document.getElementById('adminEmail').value, password: document.getElementById('adminPassword').value }); if(data.user.id === ADMIN_USER_ID) { appState.isAdmin = true; document.getElementById('adminControls').style.display='block'; closeModal(); loadNews(); renderPeopleList(); } else { alert("Not authorized"); } }
+async function handleAdminLogin(e) { e.preventDefault(); const { data } = await supabase.auth.signInWithPassword({ email: document.getElementById('adminEmail').value, password: document.getElementById('adminPassword').value }); if(data.user?.id === ADMIN_USER_ID) { appState.isAdmin = true; document.getElementById('adminControls').style.display='block'; closeModal(); loadNews(); renderPeopleList(); } else { alert("Not authorized"); } }
 function updateStats() { const count = appState.people.length; const scores = appState.people.map(p => p.score); const avg = count ? Math.floor(scores.reduce((a,b)=>a+b,0)/count) : 0; const max = count ? Math.max(...scores) : 0; document.getElementById('totalCount').innerText = count; document.getElementById('avgScore').innerText = avg; document.getElementById('highestScore').innerText = max; }
 
 // --- CHAT LOGIC ---
 
-let lastLoadedChatMessages = []; // Cache to allow re-rendering after login without fetching
+let lastLoadedChatMessages = []; 
 
 async function loadChat() {
     const { data } = await supabase.from('chat_messages').select('*').order('created_at', {ascending: true}).limit(50);
@@ -323,7 +369,6 @@ async function loadChat() {
 function renderChatList(messages) {
     const container = document.getElementById('chatMessages');
     container.innerHTML = messages.map(m => {
-        // If user not logged in, all messages are 'other'. If logged in, check ID.
         const isOwn = appState.currentUser && m.user_id === appState.currentUser.id;
         return `
             <div class="chat-msg ${isOwn ? 'msg-own' : 'msg-other'}">
@@ -341,7 +386,6 @@ async function sendChat(e) {
     const msg = input.value.trim();
     if(!msg || !appState.currentUser || !appState.username) return;
     
-    // Clear input immediately for better UX
     input.value = '';
     
     await supabase.from('chat_messages').insert({
@@ -354,9 +398,8 @@ async function sendChat(e) {
 function setupRealtime() {
     supabase.channel('public:chat_messages')
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_messages' }, payload => {
-        // Add new message to local cache and re-render
         lastLoadedChatMessages.push(payload.new);
-        if (lastLoadedChatMessages.length > 50) lastLoadedChatMessages.shift(); // Keep cache size manageable
+        if (lastLoadedChatMessages.length > 50) lastLoadedChatMessages.shift();
         renderChatList(lastLoadedChatMessages);
     }).subscribe();
 }
