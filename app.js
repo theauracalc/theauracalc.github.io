@@ -15,14 +15,26 @@ let appState = {
     username: null
 };
 
-document.addEventListener('DOMContentLoaded', async () => {
+// --- OPTIMIZED INITIALIZATION ---
+document.addEventListener('DOMContentLoaded', () => {
+    // 1. Setup listeners immediately so buttons work even if data is loading
     setupListeners();
-    await initAuth();
-    await loadSettings();
-    await loadPeople();
-    await loadNews();
-    await loadChat();
-    setupRealtime();
+
+    // 2. Visual Feedback: Let user know we are connecting
+    const chatInput = document.getElementById('chatInput');
+    if(chatInput) chatInput.placeholder = "Connecting to secure channel...";
+
+    // 3. PARALLEL LOADING (The Fix)
+    // We fire all requests at the same time instead of waiting for one to finish before starting the next.
+    Promise.all([
+        loadSettings(),
+        loadPeople(),
+        loadNews(),
+        loadChat(),
+        initAuth() // Auth runs in parallel with data loading
+    ]).then(() => {
+        setupRealtime(); // Connect realtime last
+    });
 });
 
 // --- CORE VOTING LOGIC ---
@@ -37,6 +49,10 @@ async function voteOnPerson(personId, voteType) {
     let isStale = false;
     if (previousVote && new Date(previousVote.created_at) < appState.lastGlobalReset) isStale = true;
 
+    // Optimistic UI update (Instant click feel)
+    // We don't wait for database to update UI color
+    // (Actual re-render happens after DB confirms, but this makes it feel snappy)
+    
     try {
         if (previousVote && !isStale) {
             if (previousVote.vote_type === voteType) {
@@ -65,7 +81,6 @@ async function refreshPersonScore(personId) {
     const { count: ups } = await supabase.from('votes').select('*', { count: 'exact', head: true }).eq('person_id', personId).eq('vote_type', 'up');
     const { count: downs } = await supabase.from('votes').select('*', { count: 'exact', head: true }).eq('person_id', personId).eq('vote_type', 'down');
 
-    // Score = 150 + (NetVotes * 5)
     const newScore = 150 + ((ups - downs) * 5); 
     
     await supabase.from('people').update({ score: newScore }).eq('id', personId);
@@ -120,32 +135,29 @@ function renderPeopleList() {
                     <button class="vote-btn down ${voteType === 'down' ? 'active' : ''}" onclick="voteOnPerson(${p.id}, 'down')">Down</button>
                 </div>
                 ${appState.isAdmin ? `
-                    <button class="btn-edit-person" onclick="openEditModal(${p.id})" title="Edit Score/Name">✎</button>
-                    <button class="btn-delete-person" onclick="deletePerson(${p.id})" title="Delete User">&times;</button>
+                    <button class="btn-edit-person" onclick="openEditModal(${p.id})">✎</button>
+                    <button class="btn-delete-person" onclick="deletePerson(${p.id})">&times;</button>
                 ` : ''}
             </div>
         `;
     }).join('');
 }
 
-// --- ADMIN FEATURES (Edit / Delete / News) ---
+// --- ADMIN FEATURES ---
 
 function openEditModal(personId = null) {
-    const modal = document.getElementById('editModal');
     const title = document.getElementById('editModalTitle');
     const nameInput = document.getElementById('personName');
     const scoreInput = document.getElementById('personScore');
     const idInput = document.getElementById('personId');
 
     if (personId) {
-        // Edit Mode
         const person = appState.people.find(p => p.id === personId);
         title.innerText = "Edit Person";
         nameInput.value = person.name;
         scoreInput.value = person.score;
         idInput.value = person.id;
     } else {
-        // Add Mode
         title.innerText = "Add Person";
         nameInput.value = "";
         scoreInput.value = 150;
@@ -161,16 +173,13 @@ async function handlePersonSubmit(e) {
     const id = document.getElementById('personId').value;
 
     if (id) {
-        // Update existing
         const { error } = await supabase.from('people').update({ name, score }).eq('id', id);
         if (!error) {
-            // Update local state instantly
             const p = appState.people.find(x => x.id == id);
             if(p) { p.name = name; p.score = score; }
         }
     } else {
-        // Create new
-        const { error } = await supabase.from('people').insert({ name, score, approved: true });
+        await supabase.from('people').insert({ name, score, approved: true });
     }
     
     closeModal();
@@ -217,11 +226,16 @@ async function deleteNews(id) {
     loadNews();
 }
 
-// --- AUTH ---
+// --- AUTH (OPTIMIZED) ---
 
 async function initAuth() {
     const { data: { session } } = await supabase.auth.getSession();
-    if (session) handleUserLogin(session.user);
+    if (session) {
+        await handleUserLogin(session.user);
+    } else {
+        // Not logged in: Chat remains visible but disabled
+        document.getElementById('chatInput').placeholder = "Login to chat";
+    }
 }
 
 async function handleUserLogin(user) {
@@ -233,20 +247,26 @@ async function handleUserLogin(user) {
         document.getElementById('adminControls').style.display = 'block';
     }
 
-    const { data } = await supabase.from('votes').select('*').eq('user_id', user.id);
-    if(data) data.forEach(v => appState.userVotes[v.person_id] = v);
+    // Load Votes & Profile in parallel
+    const [votesRes, profileRes] = await Promise.all([
+        supabase.from('votes').select('*').eq('user_id', user.id),
+        supabase.from('user_profiles').select('username').eq('user_id', user.id).single()
+    ]);
+
+    if(votesRes.data) votesRes.data.forEach(v => appState.userVotes[v.person_id] = v);
     
-    const { data: profile } = await supabase.from('user_profiles').select('username').eq('user_id', user.id).single();
-    if (profile) {
-        appState.username = profile.username;
+    if (profileRes.data) {
+        appState.username = profileRes.data.username;
         document.getElementById('chatInput').disabled = false;
         document.getElementById('chatSendBtn').disabled = false;
+        document.getElementById('chatInput').placeholder = "Join the conversation...";
     } else {
         openModal('userAuthModal');
     }
     
-    loadPeople();
-    loadNews(); 
+    // Re-render UI now that we know who the user is (update vote buttons colors and chat sides)
+    renderPeopleList();
+    renderChatList(lastLoadedChatMessages); // Uses cached chat messages to fix alignment
 }
 
 // --- LISTENERS ---
@@ -261,12 +281,8 @@ function setupListeners() {
     document.getElementById('adminBtn').onclick = () => appState.isAdmin ? (appState.isAdmin=false, document.getElementById('adminControls').style.display='none', loadPeople(), loadNews()) : openModal('adminLoginModal');
     document.getElementById('adminLoginForm').onsubmit = handleAdminLogin;
     
-    // UPDATED: Use handlePersonSubmit for both Add and Edit
     document.getElementById('personForm').onsubmit = handlePersonSubmit;
-    
     document.getElementById('resetCooldownBtn').onclick = resetVoting;
-    
-    // UPDATED: "Add Person" button now just opens the modal in "Add" mode
     document.getElementById('addPersonBtn').onclick = () => openEditModal(null);
     
     document.getElementById('manageNewsBtn').onclick = () => openModal('newsModal');
@@ -291,6 +307,56 @@ async function loadSettings() { const { data } = await supabase.from('app_settin
 async function resetVoting() { if(!confirm("Start new round?")) return; const now = new Date().toISOString(); await supabase.from('app_settings').upsert({key:'last_voting_reset', value:now}); appState.lastGlobalReset = new Date(now); appState.userVotes = {}; renderPeopleList(); }
 async function handleAdminLogin(e) { e.preventDefault(); const { data } = await supabase.auth.signInWithPassword({ email: document.getElementById('adminEmail').value, password: document.getElementById('adminPassword').value }); if(data.user.id === ADMIN_USER_ID) { appState.isAdmin = true; document.getElementById('adminControls').style.display='block'; closeModal(); loadNews(); renderPeopleList(); } else { alert("Not authorized"); } }
 function updateStats() { const count = appState.people.length; const scores = appState.people.map(p => p.score); const avg = count ? Math.floor(scores.reduce((a,b)=>a+b,0)/count) : 0; const max = count ? Math.max(...scores) : 0; document.getElementById('totalCount').innerText = count; document.getElementById('avgScore').innerText = avg; document.getElementById('highestScore').innerText = max; }
-async function loadChat() { const { data } = await supabase.from('chat_messages').select('*').order('created_at', {ascending: true}).limit(50); const container = document.getElementById('chatMessages'); if(data) { container.innerHTML = data.map(m => { const isOwn = appState.currentUser && m.user_id === appState.currentUser.id; return `<div class="chat-msg ${isOwn ? 'msg-own' : 'msg-other'}"><span class="msg-user">${escapeHtml(m.username)}</span>${escapeHtml(m.message)}</div>`; }).join(''); container.scrollTop = container.scrollHeight; } }
-async function sendChat(e) { e.preventDefault(); const input = document.getElementById('chatInput'); const msg = input.value.trim(); if(!msg || !appState.currentUser || !appState.username) return; await supabase.from('chat_messages').insert({ user_id: appState.currentUser.id, username: appState.username, message: msg }); input.value = ''; }
-function setupRealtime() { supabase.channel('public:chat_messages').on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_messages' }, payload => { const container = document.getElementById('chatMessages'); const m = payload.new; const isOwn = appState.currentUser && m.user_id === appState.currentUser.id; const div = document.createElement('div'); div.className = `chat-msg ${isOwn ? 'msg-own' : 'msg-other'}`; div.innerHTML = `<span class="msg-user">${escapeHtml(m.username)}</span>${escapeHtml(m.message)}`; container.appendChild(div); container.scrollTop = container.scrollHeight; }).subscribe(); }
+
+// --- CHAT LOGIC ---
+
+let lastLoadedChatMessages = []; // Cache to allow re-rendering after login without fetching
+
+async function loadChat() {
+    const { data } = await supabase.from('chat_messages').select('*').order('created_at', {ascending: true}).limit(50);
+    if(data) {
+        lastLoadedChatMessages = data;
+        renderChatList(data);
+    }
+}
+
+function renderChatList(messages) {
+    const container = document.getElementById('chatMessages');
+    container.innerHTML = messages.map(m => {
+        // If user not logged in, all messages are 'other'. If logged in, check ID.
+        const isOwn = appState.currentUser && m.user_id === appState.currentUser.id;
+        return `
+            <div class="chat-msg ${isOwn ? 'msg-own' : 'msg-other'}">
+                <span class="msg-user">${escapeHtml(m.username)}</span>
+                ${escapeHtml(m.message)}
+            </div>
+        `;
+    }).join('');
+    container.scrollTop = container.scrollHeight;
+}
+
+async function sendChat(e) {
+    e.preventDefault();
+    const input = document.getElementById('chatInput');
+    const msg = input.value.trim();
+    if(!msg || !appState.currentUser || !appState.username) return;
+    
+    // Clear input immediately for better UX
+    input.value = '';
+    
+    await supabase.from('chat_messages').insert({
+        user_id: appState.currentUser.id,
+        username: appState.username,
+        message: msg
+    });
+}
+
+function setupRealtime() {
+    supabase.channel('public:chat_messages')
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_messages' }, payload => {
+        // Add new message to local cache and re-render
+        lastLoadedChatMessages.push(payload.new);
+        if (lastLoadedChatMessages.length > 50) lastLoadedChatMessages.shift(); // Keep cache size manageable
+        renderChatList(lastLoadedChatMessages);
+    }).subscribe();
+}
